@@ -360,3 +360,248 @@ connected to. The translation is completely transparent to the application.
 | 6   | Cilium eBPF program on agent `eth0` | Endpoint map lookup; redirects packet to `lxcBBBB` |
 | 7   | Cilium eBPF program on `lxcBBBB` | Connection tracking, ingress policy, delivery to pod B |
 | Return | Cilium eBPF program on server `eth0` | Reverse SNAT: rewrites reply source from pod B back to ClusterIP |
+
+---
+
+## Why Cilium scales better than kube-proxy
+
+### How kube-proxy works
+
+kube-proxy is a user-space process that watches the Kubernetes API server for
+Service and Endpoints objects. Each time a Service is created, updated, or
+deleted, kube-proxy translates the current state of all Services and all their
+backing endpoints into a set of **iptables rules** and writes them into the
+Linux kernel's netfilter subsystem.
+
+To handle destination network address translation for a Service with three
+backing pods, kube-proxy generates rules roughly like the following:
+
+```
+PREROUTING chain:
+  match dst=10.43.0.50:80 → jump to KUBE-SVC-XXXXX
+
+KUBE-SVC-XXXXX chain:
+  33% probability → jump to KUBE-SEP-AAA   (pod 1)
+  50% probability → jump to KUBE-SEP-BBB   (pod 2, 50% of remaining 67%)
+  100%            → jump to KUBE-SEP-CCC   (pod 3, all remaining)
+
+KUBE-SEP-AAA chain:
+  DNAT dst → 10.42.0.2:8080
+
+KUBE-SEP-BBB chain:
+  DNAT dst → 10.42.1.2:8080
+
+KUBE-SEP-CCC chain:
+  DNAT dst → 10.42.2.2:8080
+```
+
+For every packet destined for any Service, the kernel must walk through these
+chains sequentially until it finds a matching rule.
+
+---
+
+### Problem 1 — rule traversal time grows linearly with cluster size
+
+iptables rules form an ordered list. Matching a packet against a rule means
+comparing fields (destination IP, port, protocol) one rule at a time, from the
+top of the chain downward, until a match is found or the chain is exhausted.
+
+With S services averaging E endpoints each, the total number of rules is
+proportional to S × E. The average number of rules a packet must traverse before
+finding its match is proportional to half that number:
+
+```
+Average rules traversed per packet  ≈  (S × E) / 2
+```
+
+This is an **O(S × E)** operation per packet. As the cluster grows, every single
+packet pays a higher processing cost.
+
+A concrete illustration:
+
+```
+Cluster size    Services    Endpoints    Rules generated    Avg rules per packet
+────────────    ────────    ─────────    ───────────────    ────────────────────
+Small              100          500           ~2 000                ~1 000
+Medium           1 000        5 000          ~20 000               ~10 000
+Large           10 000       50 000         ~200 000              ~100 000
+```
+
+In a large cluster, every service packet causes the CPU to evaluate one hundred
+thousand comparisons. This happens in the kernel, synchronously, on the critical
+path of packet delivery.
+
+Cilium uses a **hash table** (a Berkeley Packet Filter map). The lookup for any
+Service takes a fixed number of operations regardless of how many Services exist:
+hash the key, index into the table, read the value. This is an **O(1)**
+operation. A cluster with ten thousand Services costs exactly the same per packet
+as a cluster with ten Services.
+
+```
+kube-proxy:   packet cost = O(S × E)   grows with cluster size
+Cilium:       packet cost = O(1)        constant regardless of cluster size
+```
+
+---
+
+### Problem 2 — rule updates require a full ruleset rewrite
+
+When a pod is added to or removed from a Service (because a Deployment scales
+up, a rolling update progresses, or a pod crashes), kube-proxy must update the
+iptables rules. However, iptables does not support modifying individual rules in
+isolation. To change anything, kube-proxy must:
+
+1. Read the entire current ruleset out of the kernel.
+2. Compute the new complete ruleset in user space.
+3. Write the entire new ruleset back into the kernel atomically.
+
+Step 3 acquires a **global iptables lock**. While this lock is held, the kernel
+cannot evaluate any iptables rule for any packet anywhere on the node. All
+packets that would match netfilter rules are stalled until the lock is released
+and the new ruleset is installed.
+
+The time this takes grows with the total number of rules:
+
+```
+Update cost = O(total rules in the entire ruleset)
+```
+
+In a large cluster with frequent pod churn (rolling deployments, autoscaling,
+health check failures), kube-proxy may be rewriting hundreds of thousands of
+rules many times per minute. Each rewrite introduces a brief period where
+packets experience elevated latency or loss, and the CPU time consumed by the
+rewrites competes with actual application workloads.
+
+Cilium maintains its Service state in Berkeley Packet Filter hash maps. When a
+pod is added or removed, the Cilium operator updates **only the affected map
+entry**:
+
+```
+// Adding a new backend pod to a Service
+bpf_map_update_elem(&service_map, &key, &new_backend, BPF_ANY);
+```
+
+This is an **O(1)** operation that does not touch any other map entry. It takes
+microseconds and requires no global lock. Packets on unrelated Services are
+completely unaffected.
+
+```
+kube-proxy:   update cost = O(total rules)    locks the entire node briefly
+Cilium:       update cost = O(1)              atomic single-entry update, no lock
+```
+
+---
+
+### Problem 3 — the kernel path is longer with iptables
+
+netfilter, the kernel subsystem that evaluates iptables rules, processes packets
+at a specific set of hooks in the kernel network stack. A packet travelling
+through a node passes through several of these hooks, and at each one the kernel
+must traverse whichever chains apply:
+
+```
+kube-proxy / iptables packet path:
+
+  NIC receives packet
+    │
+    ▼
+  netfilter PREROUTING hook
+    → traverse NAT PREROUTING chain (DNAT here)
+    │
+    ▼
+  kernel routing decision
+    │
+    ▼
+  netfilter FORWARD hook
+    → traverse FILTER FORWARD chain (accept/drop)
+    │
+    ▼
+  netfilter POSTROUTING hook
+    → traverse NAT POSTROUTING chain (masquerade/SNAT)
+    │
+    ▼
+  packet leaves NIC
+```
+
+Each hook is a mandatory stop. Even if no rules match, the kernel must enter
+each hook, walk the default chains, and reach the end before continuing. This
+adds multiple fixed overheads to every packet, completely independent of the
+rules themselves.
+
+Cilium attaches its extended Berkeley Packet Filter program to the **traffic
+control ingress hook** of the virtual ethernet interface, which runs before
+netfilter. When Cilium handles a packet, it performs the entire service lookup,
+destination network address translation, connection tracking, and policy
+enforcement in a single pass through one program. For locally delivered packets
+it uses `bpf_redirect` to inject the packet directly into the destination
+interface, bypassing the routing subsystem and all netfilter hooks entirely:
+
+```
+Cilium packet path:
+
+  NIC receives packet (or virtual ethernet pair)
+    │
+    ▼
+  traffic control ingress hook
+    → Cilium eBPF program:
+        service map lookup      O(1)
+        DNAT if needed          in-place rewrite
+        connection tracking     BPF map update
+        policy check            BPF map lookup
+        bpf_redirect            inject to destination veth
+    │
+    ▼
+  packet delivered to pod  (netfilter: skipped entirely)
+```
+
+The number of kernel subsystems the packet passes through is smaller, and the
+cost of each stop does not grow with cluster size.
+
+---
+
+### Problem 4 — probabilistic load balancing creates uneven distribution
+
+kube-proxy distributes traffic across backends using chained probability rules.
+For three backends, the first rule fires with 33% probability, the second with
+50% of the remaining 67% (which is approximately 33%), and the third catches
+everything else. This works correctly in expectation but relies on randomness,
+which means short-lived connections or small traffic volumes can produce
+noticeably uneven distribution.
+
+Cilium uses **Maglev consistent hashing**. For each Service, Cilium precomputes
+a lookup table (of configurable size, default 65537 entries) where each backend
+pod is assigned a number of slots proportional to its weight. The slot for a
+given connection is determined by hashing the five-tuple (source IP, source
+port, destination IP, destination port, protocol). This produces a deterministic
+and highly uniform distribution:
+
+- Two packets with the same five-tuple always go to the same backend, providing
+  connection affinity without requiring stateful tracking of which backend was
+  chosen.
+- When a backend is added or removed, only the slots that were assigned to it
+  are redistributed. Existing connections to other backends are not disrupted.
+
+---
+
+### Summary of scaling differences
+
+```
+Property                      kube-proxy (iptables)          Cilium (eBPF)
+────────────────────────────  ─────────────────────────────  ──────────────────────────────
+Per-packet service lookup     O(S × E) — linear chain walk   O(1) — hash table lookup
+Rule/map update on pod change O(total rules) — full rewrite  O(1) — single map entry
+Locking during update         Global iptables lock           None — atomic per-entry update
+Kernel hooks traversed        PREROUTING + FORWARD +         One tc ingress hook
+                              POSTROUTING (always)
+Load balancing algorithm      Chained probability (uneven    Maglev consistent hashing
+                              on small sample sizes)         (deterministic, uniform)
+Observability                 None built in                  Hubble: per-flow metrics,
+                                                             drop reasons, latency
+```
+
+At the scale of two nodes this difference is not measurable in practice. The
+reason for documenting it here is that the architectural choice made at
+provisioning time (disabling kube-proxy, enabling Cilium kube-proxy
+replacement) is what determines whether the cluster can grow to hundreds of
+nodes and tens of thousands of services without degrading per-packet latency or
+spending significant CPU time on network rule management.
