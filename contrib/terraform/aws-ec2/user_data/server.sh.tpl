@@ -3,13 +3,12 @@ set -euo pipefail
 exec > >(tee /var/log/k3s-server-init.log) 2>&1
 
 # ── Jumbo frames ───────────────────────────────────────────────────────────────
-# AWS VPC supports 9001-byte MTU (jumbo frames) on all instance types.
-# Raising the physical MTU reduces per-packet overhead for bulk transfers and
-# lets Flannel use a larger pod-network MTU after subtracting encapsulation
-# headers (VXLAN: -50 B → 8951; host-gw: no overhead → 9001).
+# AWS VPC supports 9001-byte MTU. A higher physical MTU lets Cilium use a
+# larger pod-network MTU after subtracting encapsulation headers:
+#   native routing : no overhead  → pod MTU 9001
+#   VXLAN tunnel   : -50 B        → pod MTU 8951
 ip link set eth0 mtu 9001
 
-# Persist MTU so it survives reboots and netplan reconciliation.
 cat > /etc/netplan/99-k3s-mtu.yaml << 'NETPLAN'
 network:
   version: 2
@@ -38,15 +37,9 @@ PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
 export INSTALL_K3S_VERSION="${k3s_version}"
 %{ endif ~}
 
-# Key flags:
-#   --flannel-backend   : ${flannel_backend}
-#                         host-gw  = zero encapsulation, lowest latency (same subnet)
-#                         vxlan    = UDP tunnel, works across subnets
-#   --flannel-iface     : bind Flannel to the primary private interface
-#   --node-ip           : advertise the private IP as the node address
-#   --advertise-address : private IP for the API server listener
-#   --tls-san           : add public IP so external kubeconfigs are valid
-#   --disable=traefik   : ship without the built-in ingress (add your own)
+# Flannel is replaced entirely by Cilium, so we disable it along with the
+# built-in network-policy controller and kube-proxy (Cilium replaces both
+# via eBPF, eliminating all iptables overhead for service routing).
 TLS_SAN_FLAGS="--tls-san=$PRIVATE_IP"
 if [ -n "$PUBLIC_IP" ]; then
   TLS_SAN_FLAGS="$TLS_SAN_FLAGS --tls-san=$PUBLIC_IP"
@@ -60,17 +53,61 @@ curl -sfL https://get.k3s.io | sh -s - server \
   --node-ip="$PRIVATE_IP" \
   --advertise-address="$PRIVATE_IP" \
   $TLS_SAN_FLAGS \
-  --flannel-backend="${flannel_backend}" \
-  --flannel-iface=eth0 \
+  --flannel-backend=none \
+  --disable-network-policy \
+  --disable-kube-proxy \
   --cluster-cidr="${cluster_cidr}" \
   --service-cidr="${service_cidr}" \
   --write-kubeconfig-mode=644 \
   --disable=traefik \
   $EXTRA_ARGS
 
-# ── Wait for the node to reach Ready ──────────────────────────────────────────
+# Wait until the node appears (it will stay NotReady until Cilium provides CNI)
+until k3s kubectl get nodes 2>/dev/null | grep -q "$(hostname)"; do
+  sleep 5
+done
+
+# ── Install Helm ───────────────────────────────────────────────────────────────
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# ── Install Cilium via Helm ────────────────────────────────────────────────────
+helm repo add cilium https://helm.cilium.io/
+helm repo update
+
+%{ if cilium_version != "" ~}
+CILIUM_VERSION_ARG="--version ${cilium_version}"
+%{ else ~}
+CILIUM_VERSION_ARG=""
+%{ endif ~}
+
+# native routing: Cilium installs a kernel route per peer node (autoDirectNodeRoutes)
+# so pod packets are forwarded as plain IP without any encapsulation.
+# tunnel mode:   Cilium wraps packets in VXLAN (UDP 8472), works across subnets.
+%{ if cilium_routing_mode == "native" ~}
+ROUTING_FLAGS="--set routingMode=native --set autoDirectNodeRoutes=true --set ipv4NativeRoutingCIDR=${cluster_cidr}"
+%{ else ~}
+ROUTING_FLAGS="--set routingMode=tunnel --set tunnelProtocol=vxlan"
+%{ endif ~}
+
+# shellcheck disable=SC2086
+helm install cilium cilium/cilium \
+  $CILIUM_VERSION_ARG \
+  --namespace kube-system \
+  --set k8sServiceHost="$PRIVATE_IP" \
+  --set k8sServicePort=6443 \
+  --set kubeProxyReplacement=true \
+  --set ipam.mode=kubernetes \
+  --set operator.replicas=1 \
+  $ROUTING_FLAGS \
+  --kubeconfig /etc/rancher/k3s/k3s.yaml
+
+# ── Wait for Cilium DaemonSet and node Ready ───────────────────────────────────
+until k3s kubectl -n kube-system rollout status daemonset/cilium --timeout=5s 2>/dev/null; do
+  sleep 5
+done
+
 until k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; do
   sleep 5
 done
 
-echo "k3s server is ready"
+echo "k3s server with Cilium CNI is ready"

@@ -1,7 +1,7 @@
 # ── Server security group ──────────────────────────────────────────────────────
 resource "aws_security_group" "server" {
   name        = "k3s-server"
-  description = "k3s control-plane: API server, Flannel, kubelet"
+  description = "k3s control-plane: API server, Cilium, kubelet"
   vpc_id      = aws_vpc.k3s.id
 
   # SSH (management)
@@ -15,10 +15,10 @@ resource "aws_security_group" "server" {
 
   # Kubernetes API — accessed by agents and external kubectl clients
   ingress {
-    description = "Kubernetes API (agent)"
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
+    description     = "Kubernetes API (agent)"
+    from_port       = 6443
+    to_port         = 6443
+    protocol        = "tcp"
     security_groups = [aws_security_group.agent.id]
   }
 
@@ -30,21 +30,21 @@ resource "aws_security_group" "server" {
     cidr_blocks = [var.admin_cidr]
   }
 
-  # Flannel VXLAN — only needed when flannel_backend = "vxlan"
+  # Cilium VXLAN tunnel — used when cilium_routing_mode = "tunnel"
   ingress {
-    description     = "Flannel VXLAN"
+    description     = "Cilium VXLAN tunnel"
     from_port       = 8472
     to_port         = 8472
     protocol        = "udp"
     security_groups = [aws_security_group.agent.id]
   }
 
-  # WireGuard — only needed when flannel_backend = "wireguard-native"
+  # Cilium health check probes (agent-to-agent on TCP 4240)
   ingress {
-    description     = "WireGuard"
-    from_port       = 51820
-    to_port         = 51820
-    protocol        = "udp"
+    description     = "Cilium health check"
+    from_port       = 4240
+    to_port         = 4240
+    protocol        = "tcp"
     security_groups = [aws_security_group.agent.id]
   }
 
@@ -70,7 +70,7 @@ resource "aws_security_group" "server" {
 # ── Agent security group ───────────────────────────────────────────────────────
 resource "aws_security_group" "agent" {
   name        = "k3s-agent"
-  description = "k3s agent: kubelet, Flannel, NodePort"
+  description = "k3s agent: kubelet, Cilium"
   vpc_id      = aws_vpc.k3s.id
 
   ingress {
@@ -105,7 +105,7 @@ resource "aws_security_group_rule" "agent_kubelet_from_server" {
 }
 
 resource "aws_security_group_rule" "agent_vxlan_from_server" {
-  description              = "Flannel VXLAN from server"
+  description              = "Cilium VXLAN tunnel from server"
   type                     = "ingress"
   from_port                = 8472
   to_port                  = 8472
@@ -114,12 +114,12 @@ resource "aws_security_group_rule" "agent_vxlan_from_server" {
   security_group_id        = aws_security_group.agent.id
 }
 
-resource "aws_security_group_rule" "agent_wireguard_from_server" {
-  description              = "WireGuard from server"
+resource "aws_security_group_rule" "agent_cilium_health_from_server" {
+  description              = "Cilium health check from server"
   type                     = "ingress"
-  from_port                = 51820
-  to_port                  = 51820
-  protocol                 = "udp"
+  from_port                = 4240
+  to_port                  = 4240
+  protocol                 = "tcp"
   source_security_group_id = aws_security_group.server.id
   security_group_id        = aws_security_group.agent.id
 }

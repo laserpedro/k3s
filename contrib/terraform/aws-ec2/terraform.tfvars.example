@@ -8,8 +8,9 @@ aws_region            = "us-east-1"
 availability_zone     = "us-east-1a"
 server_instance_type  = "t3.medium"   # use c5n/m5n for production workloads
 agent_instance_type   = "t3.medium"
-flannel_backend       = "host-gw"     # fastest option when nodes share a subnet
 k3s_version           = ""            # leave empty for latest stable
+cilium_version        = ""            # leave empty for latest Cilium chart
+cilium_routing_mode   = "native"      # native = zero overhead (same subnet); tunnel = VXLAN
 
 # Uncomment to restrict SSH/API access to your IP
 # admin_cidr = "203.0.113.10/32"

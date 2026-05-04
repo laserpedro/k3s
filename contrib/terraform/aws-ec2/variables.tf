@@ -17,7 +17,7 @@ variable "vpc_cidr" {
 }
 
 variable "subnet_cidr" {
-  description = "CIDR block for the subnet (both nodes share it to allow host-gw routing)"
+  description = "CIDR block for the subnet (both nodes share it to allow Cilium native routing)"
   type        = string
   default     = "10.0.1.0/24"
 }
@@ -74,18 +74,26 @@ variable "k3s_token" {
   sensitive   = true
 }
 
-# flannel_backend controls pod-network performance:
-#   host-gw        – no encapsulation, lowest latency; requires nodes on the same L2 subnet
-#   vxlan          – UDP encapsulation, works across subnets; default k3s upstream choice
-#   wireguard-native – encrypted; also open UDP 51820 in security groups when using this
-variable "flannel_backend" {
-  description = "Flannel backend. 'host-gw' gives the best performance when both nodes are in the same subnet."
+# ── Cilium CNI configuration ───────────────────────────────────────────────────
+variable "cilium_version" {
+  description = "Cilium Helm chart version (e.g. 1.17.0). Leave empty for the latest chart version."
   type        = string
-  default     = "host-gw"
+  default     = ""
+}
+
+# cilium_routing_mode controls how pod packets travel between nodes:
+#   native  – zero encapsulation; Cilium installs a kernel route per peer node so
+#             packets are forwarded directly. Requires nodes on the same L2 subnet
+#             and source_dest_check = false on the instances.
+#   tunnel  – VXLAN encapsulation (UDP 8472); works across different subnets.
+variable "cilium_routing_mode" {
+  description = "Cilium routing mode. 'native' has zero overhead when nodes share a subnet."
+  type        = string
+  default     = "native"
 
   validation {
-    condition     = contains(["host-gw", "vxlan", "wireguard-native", "none"], var.flannel_backend)
-    error_message = "flannel_backend must be one of: host-gw, vxlan, wireguard-native, none."
+    condition     = contains(["native", "tunnel"], var.cilium_routing_mode)
+    error_message = "cilium_routing_mode must be 'native' or 'tunnel'."
   }
 }
 

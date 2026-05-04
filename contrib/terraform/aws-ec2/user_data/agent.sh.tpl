@@ -3,8 +3,7 @@ set -euo pipefail
 exec > >(tee /var/log/k3s-agent-init.log) 2>&1
 
 # ── Jumbo frames ───────────────────────────────────────────────────────────────
-# Match the server MTU so the full 9001-byte path is end-to-end; mismatched
-# MTUs would cause silent fragmentation on Flannel traffic.
+# Must match the server MTU so the full 9001-byte path is end-to-end.
 ip link set eth0 mtu 9001
 
 cat > /etc/netplan/99-k3s-mtu.yaml << 'NETPLAN'
@@ -21,8 +20,8 @@ apt-get update -y
 apt-get install -y curl netcat-openbsd
 
 # ── Wait for k3s API server ────────────────────────────────────────────────────
-# Terraform already orders creation (server before agent), but the OS-level
-# userdata runs asynchronously; poll until the API port is reachable.
+# Terraform orders creation (server before agent), but user_data runs
+# asynchronously; poll until the API port is reachable.
 echo "Waiting for k3s server at ${server_private_ip}:6443 ..."
 until nc -z "${server_private_ip}" 6443; do
   sleep 5
@@ -43,13 +42,14 @@ export INSTALL_K3S_VERSION="${k3s_version}"
 
 EXTRA_ARGS="${extra_args}"
 
+# Cilium's DaemonSet deploys automatically to this node once it joins.
+# No CNI flags needed here — Cilium manages its own CNI binary installation.
 # shellcheck disable=SC2086
 curl -sfL https://get.k3s.io | \
   K3S_URL="https://${server_private_ip}:6443" \
   K3S_TOKEN="${k3s_token}" \
   sh -s - agent \
     --node-ip="$PRIVATE_IP" \
-    --flannel-iface=eth0 \
     $EXTRA_ARGS
 
 echo "k3s agent joined the cluster"

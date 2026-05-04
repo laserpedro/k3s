@@ -41,8 +41,8 @@ resource "aws_instance" "server" {
 
   vpc_security_group_ids = [aws_security_group.server.id]
 
-  # Required for host-gw flannel: packets originate from / are destined to
-  # pod CIDRs, not the instance's own IP.
+  # Cilium native routing: pod packets carry pod-CIDR src/dst IPs, not the
+  # instance IP, so AWS would drop them without this setting disabled.
   source_dest_check = false
 
   # IMDSv2 — token-based metadata access; hop-limit 2 allows in-pod IMDS use.
@@ -61,12 +61,13 @@ resource "aws_instance" "server" {
   }
 
   user_data = templatefile("${path.module}/user_data/server.sh.tpl", {
-    k3s_version      = var.k3s_version
-    k3s_token        = local.k3s_token
-    flannel_backend  = var.flannel_backend
-    cluster_cidr     = var.cluster_cidr
-    service_cidr     = var.service_cidr
-    extra_args       = var.server_extra_args
+    k3s_version         = var.k3s_version
+    k3s_token           = local.k3s_token
+    cluster_cidr        = var.cluster_cidr
+    service_cidr        = var.service_cidr
+    cilium_version      = var.cilium_version
+    cilium_routing_mode = var.cilium_routing_mode
+    extra_args          = var.server_extra_args
   })
 
   tags = merge(local.common_tags, {
